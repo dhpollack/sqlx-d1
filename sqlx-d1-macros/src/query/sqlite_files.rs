@@ -3,7 +3,7 @@ use sha2::Sha256;
 
 pub type HmacSha256 = Hmac<Sha256>;
 
-pub fn durable_object_namespace_id_from_database_id(unique_key: &str, database_id: &str) -> String {
+pub fn durable_object_namespace_id_from_database_id(unique_key: &str, database_id: &str) -> Result<String, hmac::digest::InvalidLength> {
     // SHA-256 hash of unique_key to create the HMAC key
     let key = {
         use sha2::Digest;
@@ -12,7 +12,7 @@ pub fn durable_object_namespace_id_from_database_id(unique_key: &str, database_i
 
     // First HMAC: key over database_id, take first 16 bytes
     let database_id_hmac = {
-        let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC can take key of any size");
+        let mut mac = HmacSha256::new_from_slice(&key)?;
         mac.update(database_id.as_bytes());
         let result = mac.finalize().into_bytes();
         result[..16].to_vec()
@@ -20,7 +20,7 @@ pub fn durable_object_namespace_id_from_database_id(unique_key: &str, database_i
 
     // Second HMAC: key over database_id_hmac, take first 16 bytes
     let hmac = {
-        let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC can take key of any size");
+        let mut mac = HmacSha256::new_from_slice(&key)?;
         mac.update(&database_id_hmac);
         let result = mac.finalize().into_bytes();
         result[..16].to_vec()
@@ -28,12 +28,12 @@ pub fn durable_object_namespace_id_from_database_id(unique_key: &str, database_i
 
     // Concatenate and hex-encode
     let combined: Vec<u8> = database_id_hmac.into_iter().chain(hmac).collect();
-    hex::encode(combined)
+    Ok(hex::encode(combined))
 }
 
 /// Compute the expected SQLite filename for a given database_id.
 /// Uses the hardcoded unique key "miniflare-D1DatabaseObject".
-pub fn expected_sqlite_filename(database_id: &str) -> String {
+pub fn expected_sqlite_filename(database_id: &str) -> Result<String, hmac::digest::InvalidLength> {
     durable_object_namespace_id_from_database_id("miniflare-D1DatabaseObject", database_id)
 }
 
@@ -47,7 +47,7 @@ mod tests {
         let hash = durable_object_namespace_id_from_database_id(
             "miniflare-D1DatabaseObject",
             "b8e63bb5-1234-49f6-abcd-a5bd4d724e69",
-        );
+        ).unwrap();
         assert_eq!(hash, "90631cd2742181c8321b3ef618ce3aa8712caf50b14959037244fdeb561d8d1a");
     }
 
@@ -56,7 +56,7 @@ mod tests {
         let hash = durable_object_namespace_id_from_database_id(
             "miniflare-D1DatabaseObject",
             "eb56671d-7425-1234-9ff2-abcda13d7c11",
-        );
+        ).unwrap();
         assert_eq!(hash, "5e477bcef7eeb0569f4e2e3d67ce1094341ab7ed685dda47f2afb66f479af046");
     }
 

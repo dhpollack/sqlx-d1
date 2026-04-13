@@ -83,7 +83,8 @@ fn expand_derive_from_row_struct(
         .iter()
         .filter_map(|field| -> Option<Stmt> {
             let id = &field.ident.as_ref()?;
-            let attributes = parse_child_attributes(&field.attrs).unwrap();
+            let attributes = parse_child_attributes(&field.attrs)
+                .expect("Failed to parse field attributes");
             let ty = &field.ty;
 
             if attributes.skip {

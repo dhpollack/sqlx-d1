@@ -108,7 +108,8 @@ impl Location {
                 let expected_filenames: Vec<String> = database_ids
                     .iter()
                     .map(|id| expected_sqlite_filename(id))
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| io::Error::other(format!("Failed to compute SQLite filename: {}", e)))?;
 
                 // Match SQLite files
                 let matches: Vec<PathBuf> = sqlite_files
@@ -211,79 +212,100 @@ impl DotSqlx {
 }
 
 pub(super) fn expand_input(input: TokenStream) -> Result<TokenStream, syn::Error> {
-    use sqlx_core::executor::Executor;
-    use sqlx_d1_core::D1Connection;
-    // Assumeing the cost of context switching is almost the same
-    // or larger than that of synchronous blocking in this case
+    // Catch panics to avoid "crashed background worker" errors
+    let result = std::panic::catch_unwind(|| -> Result<TokenStream, syn::Error> {
+        use sqlx_core::executor::Executor;
+        use sqlx_d1_core::D1Connection;
+        // Assumeing the cost of context switching is almost the same
+        // or larger than that of synchronous blocking in this case
 
-    let input = syn::parse2::<self::input::QueryMacroInput>(input)?;
+        let input = syn::parse2::<self::input::QueryMacroInput>(input)?;
 
-    let describe = match LOCATION.miniflare_sqlite_files().map_err(|e| syn::Error::new(Span::call_site(), e))? {
-        sqlite_file_paths if !sqlite_file_paths.is_empty() => {
-            // Collect describes from all databases
-            let mut describes = Vec::new();
-            for sqlite_file_path in sqlite_file_paths {
-                // Create connection for this file
-                let conn = futures_lite::future::block_on(async {
-                    D1Connection::connect(&format!("sqlite://{}", sqlite_file_path.display()))
-                        .await
-                        .map_err(|e| syn::Error::new(Span::call_site(), e))
-                })?;
+        let describe = match LOCATION.miniflare_sqlite_files().map_err(|e| syn::Error::new(Span::call_site(), e))? {
+            sqlite_file_paths if !sqlite_file_paths.is_empty() => {
+                // Collect describes from all databases
+                let mut describes = Vec::new();
+                for sqlite_file_path in sqlite_file_paths {
+                    // Create connection for this file
+                    let conn = futures_lite::future::block_on(async {
+                        D1Connection::connect(&format!("sqlite://{}", sqlite_file_path.display()))
+                            .await
+                            .map_err(|e| syn::Error::new(Span::call_site(), e))
+                    })?;
 
-                let describe = futures_lite::future::block_on(async {
-                    conn.describe(&input.sql).await
-                }).map_err(|e| syn::Error::new(input.src_span, e))?;
+                    let describe = futures_lite::future::block_on(async {
+                        conn.describe(&input.sql).await
+                    }).map_err(|e| syn::Error::new(input.src_span, e))?;
 
-                describes.push((sqlite_file_path, describe));
-            }
-
-            // Ensure all describes are identical
-            // Take first describe out of the vector to own it
-            let (first_path, first_describe) = describes.remove(0);
-            for (path, describe) in &describes {
-                // Compare describes by serializing to JSON
-                let first_json = serde_json::to_string(&first_describe)
-                    .map_err(|e| syn::Error::new(Span::call_site(), format!("Failed to serialize describe: {}", e)))?;
-                let current_json = serde_json::to_string(describe)
-                    .map_err(|e| syn::Error::new(Span::call_site(), format!("Failed to serialize describe: {}", e)))?;
-
-                if first_json != current_json {
-                    return Err(syn::Error::new(
-                        Span::call_site(),
-                        format!("Schema mismatch between databases. Query validation differs between databases. First database: {:?}, current database: {:?}",
-                                first_path, path)
-                    ));
+                    describes.push((sqlite_file_path, describe));
                 }
+
+                // Ensure all describes are identical
+                // Take first describe out of the vector to own it
+                let (first_path, first_describe) = describes.remove(0);
+                for (path, describe) in &describes {
+                    // Compare describes by serializing to JSON
+                    let first_json = serde_json::to_string(&first_describe)
+                        .map_err(|e| syn::Error::new(Span::call_site(), format!("Failed to serialize describe: {}", e)))?;
+                    let current_json = serde_json::to_string(describe)
+                        .map_err(|e| syn::Error::new(Span::call_site(), format!("Failed to serialize describe: {}", e)))?;
+
+                    if first_json != current_json {
+                        return Err(syn::Error::new(
+                            Span::call_site(),
+                            format!("Schema mismatch between databases. Query validation differs between databases. First database: {:?}, current database: {:?}",
+                                    first_path, path)
+                        ));
+                    }
+                }
+
+                // All describes match, use first one
+                first_describe
             }
 
-            // All describes match, use first one
-            first_describe
-        }
+            // No SQLite files found, fall back to .sqlx cache
+            _ => match LOCATION.dot_sqlx_dir().map_err(|e| syn::Error::new(input.src_span, e))? {
+                Some(dot_sqlx_dir) => dot_sqlx_dir
+                    .get_cached_describe_of(&input.sql)
+                    .map_err(|e| syn::Error::new(input.src_span, e))?
+                    .ok_or_else(|| syn::Error::new(
+                        input.src_span,
+                        "there is no cached data for this query, run `cargo sqlx prepare` to update the query cache"
+                    ))?,
 
-        // No SQLite files found, fall back to .sqlx cache
-        _ => match LOCATION.dot_sqlx_dir().map_err(|e| syn::Error::new(input.src_span, e))? {
-            Some(dot_sqlx_dir) => dot_sqlx_dir
-                .get_cached_describe_of(&input.sql)
-                .map_err(|e| syn::Error::new(input.src_span, e))?
-                .ok_or_else(|| syn::Error::new(
+                None => return Err(syn::Error::new(
                     input.src_span,
-                    "there is no cached data for this query, run `cargo sqlx prepare` to update the query cache"
-                ))?,
+                    "Neither miniflare D1 emulator nor .sqlx directory is found ! \n\
+                    For setting up miniflare, run \
+                    `wrangler d1 migrations create <BINDING> <MIGRATION>` and \
+                    `wrangler d1 migrations apply <BINDING> --local`.\n\
+                    For setting up .sqlx directory for offline mode, \
+                    run `cargo sqlx prepare` where `cargo sqlx` is installed and \
+                    miniflare D1 emulator is accessable (offen your local PC)."
+                ))
+            }
+        };
 
-            None => return Err(syn::Error::new(
-                input.src_span,
-                "Neither miniflare D1 emulator nor .sqlx directory is found ! \n\
-                For setting up miniflare, run \
-                `wrangler d1 migrations create <BINDING> <MIGRATION>` and \
-                `wrangler d1 migrations apply <BINDING> --local`.\n\
-                For setting up .sqlx directory for offline mode, \
-                run `cargo sqlx prepare` where `cargo sqlx` is installed and \
-                miniflare D1 emulator is accessable (offen your local PC)."
+        compare_expand(input, describe)
+    });
+
+    match result {
+        Ok(inner_result) => inner_result,
+        Err(panic) => {
+            // Convert panic to a user-friendly error
+            let panic_msg = if let Some(s) = panic.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = panic.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "Unknown panic".to_string()
+            };
+            Err(syn::Error::new(
+                Span::call_site(),
+                format!("Macro panicked: {}", panic_msg)
             ))
         }
-    };
-
-    compare_expand(input, describe)
+    }
 }
 
 /// ref: <https://github.com/launchbadge/sqlx/blob/1c7b3d0751cdca5a08fbfa7f24c985fc3774cf11/sqlx-macros-core/src/query/mod.rs#L241-379>
@@ -334,7 +356,8 @@ fn compare_expand(
             input::RecordType::Generated => {
                 let columns = self::output::columns_to_rust(&describe)?;
 
-                let record_type_name_token = syn::parse_str::<syn::Type>("Record").unwrap();
+                let record_type_name_token = syn::parse_str::<syn::Type>("Record")
+                    .expect("Failed to parse 'Record' as Type - this should never happen");
 
                 for rust_column in &columns {
                     if rust_column.type_.is_wildcard() {

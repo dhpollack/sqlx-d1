@@ -227,7 +227,7 @@ fn get_column_type(i: usize, column: &<D1 as Database>::Column) -> TokenStream {
     let type_info = column.type_info();
 
     <D1 as sqlx_core::type_checking::TypeChecking>::return_type_for_id(type_info)
-        .map(|t| t.parse().unwrap())
+        .map(|t| t.parse().expect("Failed to parse type string"))
         .unwrap_or_else(|| {
             syn::Error::new(
                 Span::call_site(),

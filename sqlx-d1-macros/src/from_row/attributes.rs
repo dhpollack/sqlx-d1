@@ -141,7 +141,7 @@ pub fn parse_container_attributes(input: &[Attribute]) -> syn::Result<SqlxContai
                     attr.parse_args_with(<Punctuated<Meta, Token![,]>>::parse_terminated)?;
 
                 if let Some(path) = list.iter().find_map(|f| f.require_path_only().ok()) {
-                    try_set!(repr, path.get_ident().unwrap().clone(), list);
+                    try_set!(repr, path.get_ident().expect("Expected identifier").clone(), list);
                 }
             }
         */
