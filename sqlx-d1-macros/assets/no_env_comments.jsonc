@@ -1,0 +1,12 @@
+// slash comments
+{
+  # bash style comment
+  "d1_databases": [
+    {
+      "binding": "noenv_d1_tutorial",
+      "database_name": "noenv-d1-tutorial", # end of line comment
+      "database_id": "12345678-1234-abcd-zyxw-012345678910"
+    }
+  ]
+}
+

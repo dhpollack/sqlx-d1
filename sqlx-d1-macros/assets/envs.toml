@@ -1,0 +1,8 @@
+[[envs.production.d1_databases]]
+binding = "stg_d1_tutorial"
+database_id = "12345678-1234-zyxw-abcd-012345678910"
+database_name = "stg-d1-tutorial"
+[[envs.staging.d1_databases]]
+binding = "stg_d1_tutorial"
+database_id = "12345678-abcd-1234-zyxw-012345678910"
+database_name = "stg-d1-tutorial"

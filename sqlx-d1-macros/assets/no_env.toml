@@ -1,0 +1,4 @@
+[[d1_databases]]
+binding = "noenv_d1_tutorial"
+database_id = "12345678-1234-abcd-zyxw-012345678910"
+database_name = "noenv-d1-tutorial"
