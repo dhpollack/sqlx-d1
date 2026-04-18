@@ -46,29 +46,18 @@ pub struct WranglerConfig {
 
 /// Search for wrangler.jsonc or wrangler.toml starting from the given directory.
 /// Searches up the directory tree until finding a config file or reaching root.
-pub fn find_wrangler_config(start_dir: &Path) -> Result<Option<PathBuf>, io::Error> {
-    let mut current = start_dir.to_path_buf();
+pub fn find_wrangler_config(parent_dir: impl AsRef<Path>) -> Result<Option<PathBuf>, io::Error> {
+    let current = parent_dir.as_ref();
+    // Check for wrangler.jsonc first (preferred)
+    let jsonc_path = current.join("wrangler.jsonc");
+    if jsonc_path.exists() && jsonc_path.is_file() {
+        return Ok(Some(jsonc_path));
+    }
 
-    loop {
-        // Check for wrangler.jsonc first (preferred)
-        let jsonc_path = current.join("wrangler.jsonc");
-        if jsonc_path.exists() && jsonc_path.is_file() {
-            return Ok(Some(jsonc_path));
-        }
-
-        // Check for wrangler.toml
-        let toml_path = current.join("wrangler.toml");
-        if toml_path.exists() && toml_path.is_file() {
-            return Ok(Some(toml_path));
-        }
-
-        // Move up to parent directory
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            // Reached root without finding config
-            break;
-        }
+    // Check for wrangler.toml
+    let toml_path = current.join("wrangler.toml");
+    if toml_path.exists() && toml_path.is_file() {
+        return Ok(Some(toml_path));
     }
 
     Ok(None)
@@ -90,13 +79,11 @@ pub fn parse_wrangler_config(path: &Path) -> Result<WranglerConfig, WranglerConf
 pub(crate) fn parse_jsonc(content: &str) -> Result<WranglerConfig, WranglerConfigError> {
     // Use json_comments crate to strip comments before parsing
     let reader = StripComments::new(content.as_bytes());
-    serde_json::from_reader(reader)
-        .map_err(|e| WranglerConfigError::InvalidJsonc(e.to_string()))
+    serde_json::from_reader(reader).map_err(|e| WranglerConfigError::InvalidJsonc(e.to_string()))
 }
 
 pub(crate) fn parse_toml(content: &str) -> Result<WranglerConfig, WranglerConfigError> {
-    toml::from_str(content)
-        .map_err(|e| WranglerConfigError::InvalidToml(e.to_string()))
+    toml::from_str(content).map_err(|e| WranglerConfigError::InvalidToml(e.to_string()))
 }
 
 /// Extract all database_id values from a config
@@ -128,13 +115,11 @@ mod tests {
     #[test]
     fn test_extract_database_ids_no_env() {
         let config = WranglerConfig {
-            d1_databases: Some(vec![
-                D1Database {
-                    binding: "test".to_string(),
-                    database_name: "test".to_string(),
-                    database_id: "12345678-1234-abcd-zyxw-012345678910".to_string(),
-                },
-            ]),
+            d1_databases: Some(vec![D1Database {
+                binding: "test".to_string(),
+                database_name: "test".to_string(),
+                database_id: "12345678-1234-abcd-zyxw-012345678910".to_string(),
+            }]),
             envs: None,
         };
 
@@ -146,37 +131,31 @@ mod tests {
     #[test]
     fn test_extract_database_ids_with_envs() {
         let config = WranglerConfig {
-            d1_databases: Some(vec![
-                D1Database {
-                    binding: "root".to_string(),
-                    database_name: "root".to_string(),
-                    database_id: "root-id".to_string(),
-                },
-            ]),
+            d1_databases: Some(vec![D1Database {
+                binding: "root".to_string(),
+                database_name: "root".to_string(),
+                database_id: "root-id".to_string(),
+            }]),
             envs: Some({
                 let mut map = HashMap::new();
                 map.insert(
                     "staging".to_string(),
                     Environment {
-                        d1_databases: Some(vec![
-                            D1Database {
-                                binding: "staging".to_string(),
-                                database_name: "staging".to_string(),
-                                database_id: "staging-id".to_string(),
-                            },
-                        ]),
+                        d1_databases: Some(vec![D1Database {
+                            binding: "staging".to_string(),
+                            database_name: "staging".to_string(),
+                            database_id: "staging-id".to_string(),
+                        }]),
                     },
                 );
                 map.insert(
                     "production".to_string(),
                     Environment {
-                        d1_databases: Some(vec![
-                            D1Database {
-                                binding: "production".to_string(),
-                                database_name: "production".to_string(),
-                                database_id: "production-id".to_string(),
-                            },
-                        ]),
+                        d1_databases: Some(vec![D1Database {
+                            binding: "production".to_string(),
+                            database_name: "production".to_string(),
+                            database_id: "production-id".to_string(),
+                        }]),
                     },
                 );
                 map
@@ -207,7 +186,10 @@ mod tests {
         let config = parse_jsonc(content).unwrap();
         assert!(config.d1_databases.is_some());
         assert_eq!(config.d1_databases.as_ref().unwrap().len(), 1);
-        assert_eq!(config.d1_databases.as_ref().unwrap()[0].database_id, "12345678-1234-abcd-zyxw-012345678910");
+        assert_eq!(
+            config.d1_databases.as_ref().unwrap()[0].database_id,
+            "12345678-1234-abcd-zyxw-012345678910"
+        );
     }
 
     #[test]
@@ -229,6 +211,10 @@ mod tests {
         let config = parse_jsonc(content).unwrap();
         assert!(config.d1_databases.is_some());
         assert_eq!(config.d1_databases.as_ref().unwrap().len(), 1);
-        assert_eq!(config.d1_databases.as_ref().unwrap()[0].database_id, "12345678-1234-abcd-zyxw-012345678910");
+        assert_eq!(
+            config.d1_databases.as_ref().unwrap()[0].database_id,
+            "12345678-1234-abcd-zyxw-012345678910"
+        );
     }
 }
+

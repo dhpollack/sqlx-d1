@@ -5,14 +5,12 @@ mod wrangler_config;
 
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
-use serde_json;
+use sqlite_files::expected_sqlite_filename;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 use syn::LitStr;
-
-use self::wrangler_config::{extract_database_ids, find_wrangler_config, parse_wrangler_config};
-use self::sqlite_files::expected_sqlite_filename;
+use wrangler_config::{extract_database_ids, find_wrangler_config, parse_wrangler_config};
 
 struct Location {
     manifest_dir: PathBuf,
@@ -56,7 +54,7 @@ static LOCATION: LazyLock<Location> = LazyLock::new(|| {
     }
 });
 impl Location {
-    fn miniflare_sqlite_files(&self) -> Result<Vec<PathBuf>, io::Error> {
+    fn miniflare_sqlite_file(&self) -> Result<Option<PathBuf>, io::Error> {
         fn miniflare_d1_dir_path_in_parent(parent_path: impl AsRef<Path>) -> PathBuf {
             parent_path
                 .as_ref()
@@ -67,6 +65,22 @@ impl Location {
                 .join("miniflare-D1DatabaseObject")
         }
 
+        let database_ids: Vec<String> = 'search: {
+            for parent_candidate in [&*LOCATION.manifest_dir, &*LOCATION.workspace_root] {
+                if let Ok(Some(cfg_path)) = find_wrangler_config(parent_candidate)
+                    && let Ok(cfg) = parse_wrangler_config(&cfg_path)
+                    && let raw_ids = extract_database_ids(&cfg)
+                    && let Ok(db_ids) = raw_ids
+                        .into_iter()
+                        .map(|id| expected_sqlite_filename(id.as_str()))
+                        .collect()
+                {
+                    break 'search db_ids;
+                }
+            }
+            return Ok(None);
+        };
+
         let miniflare_d1_dir = 'search: {
             for parent_candidate in [&*LOCATION.manifest_dir, &*LOCATION.workspace_root] {
                 let candidate = miniflare_d1_dir_path_in_parent(parent_candidate);
@@ -74,62 +88,26 @@ impl Location {
                     break 'search candidate;
                 }
             }
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
-        let sqlite_files = std::fs::read_dir(miniflare_d1_dir)?
+        let mut sqlite_files = std::fs::read_dir(miniflare_d1_dir)?
             .filter_map(|r| r.as_ref().ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "sqlite"))
+            .filter(|p| {
+                p.extension().is_some_and(|x| x == "sqlite")
+                    && p.file_stem().is_some_and(|x| {
+                        database_ids.contains(&x.to_str().expect("not a string").to_string())
+                    })
+            })
             .collect::<Vec<_>>();
 
         match sqlite_files.len() {
-            0 => Ok(Vec::new()),
-            1 => Ok(vec![sqlite_files.into_iter().next().unwrap()]),
-            _ => {
-                // Multiple SQLite files - need to use wrangler config to identify the correct one
-
-                // Try to find wrangler config in manifest dir, then workspace root
-                let config_path = find_wrangler_config(&self.manifest_dir)
-                    .or_else(|_| find_wrangler_config(&self.workspace_root))?
-                    .ok_or_else(|| io::Error::other(
-                        "Multiple SQLite files found but no wrangler config (wrangler.jsonc or wrangler.toml) found"
-                    ))?;
-
-                let config = parse_wrangler_config(&config_path)?;
-                let database_ids = extract_database_ids(&config);
-
-                if database_ids.is_empty() {
-                    return Err(io::Error::other(
-                        "Multiple SQLite files found but wrangler config has no d1_databases"
-                    ));
-                }
-
-                // Compute expected filenames for each database ID
-                let expected_filenames: Vec<String> = database_ids
-                    .iter()
-                    .map(|id| expected_sqlite_filename(id))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| io::Error::other(format!("Failed to compute SQLite filename: {}", e)))?;
-
-                // Match SQLite files
-                let matches: Vec<PathBuf> = sqlite_files
-                    .into_iter()
-                    .filter(|path| {
-                        let stem = path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("");
-                        expected_filenames.contains(&stem.to_string())
-                    })
-                    .collect();
-
-                if matches.is_empty() {
-                    Err(io::Error::other(
-                        "Multiple SQLite files found but none match database IDs in wrangler config"
-                    ))
-                } else {
-                    Ok(matches)
-                }
-            }
+            0 => Ok(None),
+            1 => Ok(sqlite_files.pop()),
+            _ => Err(io::Error::other(
+                "Multiple miniflare's D1 emulators are found! \
+                Sorry, sqlx_d1 only supports single D1 binding now.",
+            )),
         }
     }
 
@@ -212,100 +190,69 @@ impl DotSqlx {
 }
 
 pub(super) fn expand_input(input: TokenStream) -> Result<TokenStream, syn::Error> {
-    // Catch panics to avoid "crashed background worker" errors
-    let result = std::panic::catch_unwind(|| -> Result<TokenStream, syn::Error> {
-        use sqlx_core::executor::Executor;
-        use sqlx_d1_core::D1Connection;
-        // Assumeing the cost of context switching is almost the same
-        // or larger than that of synchronous blocking in this case
+    use sqlx_core::executor::Executor;
+    use sqlx_d1_core::D1Connection;
+    // Assumeing the cost of context switching is almost the same
+    // or larger than that of synchronous blocking in this case
+    use std::sync::Mutex;
 
-        let input = syn::parse2::<self::input::QueryMacroInput>(input)?;
+    let input = syn::parse2::<self::input::QueryMacroInput>(input)?;
 
-        let describe = match LOCATION.miniflare_sqlite_files().map_err(|e| syn::Error::new(Span::call_site(), e))? {
-            sqlite_file_paths if !sqlite_file_paths.is_empty() => {
-                // Collect describes from all databases
-                let mut describes = Vec::new();
-                for sqlite_file_path in sqlite_file_paths {
-                    // Create connection for this file
-                    let conn = futures_lite::future::block_on(async {
-                        D1Connection::connect(&format!("sqlite://{}", sqlite_file_path.display()))
-                            .await
-                            .map_err(|e| syn::Error::new(Span::call_site(), e))
-                    })?;
+    let describe = match LOCATION.miniflare_sqlite_file().map_err(|e| syn::Error::new(Span::call_site(), e))? {
+        Some(sqlite_file_path) => {
+            static CONNECTION: OnceLock<Result<Mutex<D1Connection>, syn::Error>> = OnceLock::new();
 
-                    let describe = futures_lite::future::block_on(async {
-                        conn.describe(&input.sql).await
-                    }).map_err(|e| syn::Error::new(input.src_span, e))?;
+            let mut conn = CONNECTION.get_or_init(|| {
+                futures_lite::future::block_on(async {
+                    let conn = D1Connection::connect(&format!("sqlite://{}", sqlite_file_path.display()))
+                        .await
+                        .map_err(|e| syn::Error::new(Span::call_site(), e))?;
+                    Ok(Mutex::new(conn))
+                })
+            }).as_ref().map_err(Clone::clone)?.lock().map_err(|_| syn::Error::new(
+                input.src_span,
+                "Bug or invalid use of `sqlx_d1`. Be sure to use `sqlx_d1` where the target is set to \
+                `wasm32-unknown-unknown` ! \n\
+                For this, typcally, place `.cargo/config.toml` of following content at the root of \
+                your project or workspace : \n\
+                \n\
+                [build]\n\
+                target = \"wasm32-unknown-unknown\"\n
+                \n\
+                If you think this of a bug, please let me know the situation in \
+                GitHub Issues (https://github.com/ohkami-rs/sqlx-d1/issues) !"
+            ))?;
 
-                    describes.push((sqlite_file_path, describe));
-                }
+            futures_lite::future::block_on(async {
+                let describe = (&mut *conn).describe(&input.sql).await;
+                drop(conn);
+                describe
+            }).map_err(|e| syn::Error::new(input.src_span, e))?
+        }
 
-                // Ensure all describes are identical
-                // Take first describe out of the vector to own it
-                let (first_path, first_describe) = describes.remove(0);
-                for (path, describe) in &describes {
-                    // Compare describes by serializing to JSON
-                    let first_json = serde_json::to_string(&first_describe)
-                        .map_err(|e| syn::Error::new(Span::call_site(), format!("Failed to serialize describe: {}", e)))?;
-                    let current_json = serde_json::to_string(describe)
-                        .map_err(|e| syn::Error::new(Span::call_site(), format!("Failed to serialize describe: {}", e)))?;
-
-                    if first_json != current_json {
-                        return Err(syn::Error::new(
-                            Span::call_site(),
-                            format!("Schema mismatch between databases. Query validation differs between databases. First database: {:?}, current database: {:?}",
-                                    first_path, path)
-                        ));
-                    }
-                }
-
-                // All describes match, use first one
-                first_describe
-            }
-
-            // No SQLite files found, fall back to .sqlx cache
-            _ => match LOCATION.dot_sqlx_dir().map_err(|e| syn::Error::new(input.src_span, e))? {
-                Some(dot_sqlx_dir) => dot_sqlx_dir
-                    .get_cached_describe_of(&input.sql)
-                    .map_err(|e| syn::Error::new(input.src_span, e))?
-                    .ok_or_else(|| syn::Error::new(
-                        input.src_span,
-                        "there is no cached data for this query, run `cargo sqlx prepare` to update the query cache"
-                    ))?,
-
-                None => return Err(syn::Error::new(
+        None => match LOCATION.dot_sqlx_dir().map_err(|e| syn::Error::new(input.src_span, e))? {
+            Some(dot_sqlx_dir) => dot_sqlx_dir
+                .get_cached_describe_of(&input.sql)
+                .map_err(|e| syn::Error::new(input.src_span, e))?
+                .ok_or_else(|| syn::Error::new(
                     input.src_span,
-                    "Neither miniflare D1 emulator nor .sqlx directory is found ! \n\
-                    For setting up miniflare, run \
-                    `wrangler d1 migrations create <BINDING> <MIGRATION>` and \
-                    `wrangler d1 migrations apply <BINDING> --local`.\n\
-                    For setting up .sqlx directory for offline mode, \
-                    run `cargo sqlx prepare` where `cargo sqlx` is installed and \
-                    miniflare D1 emulator is accessable (offen your local PC)."
-                ))
-            }
-        };
+                    "there is no cached data for this query, run `cargo sqlx prepare` to update the query cache"
+                ))?,
 
-        compare_expand(input, describe)
-    });
-
-    match result {
-        Ok(inner_result) => inner_result,
-        Err(panic) => {
-            // Convert panic to a user-friendly error
-            let panic_msg = if let Some(s) = panic.downcast_ref::<String>() {
-                s.clone()
-            } else if let Some(s) = panic.downcast_ref::<&str>() {
-                s.to_string()
-            } else {
-                "Unknown panic".to_string()
-            };
-            Err(syn::Error::new(
-                Span::call_site(),
-                format!("Macro panicked: {}", panic_msg)
+            None => return Err(syn::Error::new(
+                input.src_span,
+                "Neither miniflare D1 emulator nor .sqlx directory is found ! \n\
+                For setting up miniflare, run \
+                `wrangler d1 migrations create <BINDING> <MIGRATION>` and \
+                `wrangler d1 migrations apply <BINDING> --local`.\n\
+                For setting up .sqlx directory for offline mode, \
+                run `cargo sqlx prepare` where `cargo sqlx` is installed and \
+                miniflare D1 emulator is accessable (offen your local PC)."
             ))
         }
-    }
+    };
+
+    compare_expand(input, describe)
 }
 
 /// ref: <https://github.com/launchbadge/sqlx/blob/1c7b3d0751cdca5a08fbfa7f24c985fc3774cf11/sqlx-macros-core/src/query/mod.rs#L241-379>
@@ -356,8 +303,7 @@ fn compare_expand(
             input::RecordType::Generated => {
                 let columns = self::output::columns_to_rust(&describe)?;
 
-                let record_type_name_token = syn::parse_str::<syn::Type>("Record")
-                    .expect("Failed to parse 'Record' as Type - this should never happen");
+                let record_type_name_token = syn::parse_str::<syn::Type>("Record").unwrap();
 
                 for rust_column in &columns {
                     if rust_column.type_.is_wildcard() {
